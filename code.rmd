@@ -1,0 +1,742 @@
+---
+title: "Group project"
+subtitle: "Group Number 3"
+author: 
+  - "Javier Torralba Flores"
+  - "Francisco Rau"
+  - "Kenéz Kovács"
+  - "Nishanth Perumal"
+  - "Izak Bragt"
+date: "Knitted on `r Sys.Date()`"
+output:
+  html_document:
+    theme: readable
+    toc: true
+    toc_depth: 4
+    toc_float: true
+    code_download: false
+    code_folding: hide
+---
+
+```{r setup, include = FALSE}
+options(max.print= 120,
+        width = 90,
+        tibble.width = 80)
+knitr::opts_chunk$set(echo= TRUE,
+                      cache=FALSE,
+                      prompt=FALSE,
+                      tidy="styler",
+                      comment=NA,
+                      message=FALSE,
+                      warning=TRUE)
+
+knitr::opts_knit$set(width=90)
+knitr::opts_chunk$set(cache.extra = knitr::rand_seed)
+knitr::opts_chunk$set(warning = F)
+knitr::opts_chunk$set(par(ask = F)) #to prevent functions from saying 'hit return to see next plot'
+set.seed(42)
+```
+
+
+
+
+#Library
+
+```{r, message = FALSE}
+
+#install.packages("rstan", repos = c("https://mc-stan.org/r-packages/", getOption("repos")))
+library(rstan)
+library(brms)
+library(tidyverse)
+library(readr)
+library(PerformanceAnalytics)
+library(ggpubr)
+#remotes::install_github("n-kall/priorsense")
+library(priorsense)
+
+options(mc.cores = parallel::detectCores()) # paralellize if possible
+options(brms.file_refit = "on_change") # save the files if the model has changed
+ggplot2::theme_set(ggplot2::theme_light()) # nicer theme
+```
+
+```{r funtions}
+normalityplotfunction <- function(dataset,ncol,nbins){
+  
+tempnames <- names(dataset)
+templist <- list()
+  
+for (i in c(1:length(tempnames))){
+
+colnames(dataset) <- tempnames
+colnames(dataset)[i] <- "temp"
+temprange <- diff(range(dataset$temp))
+
+templist [[i]] <- 
+  ggplot(dataset, aes(x = temp)) +
+  geom_histogram(aes(y = ..density..), # the histogram will display "density" on its y-axis
+                 binwidth = temprange/nbins, colour = "blue", fill = "white",
+                 breaks = seq(min(dataset$temp)-temprange/5, max(dataset$temp)+temprange/5, by = temprange/(nbins+2))) +
+  geom_density(alpha = .3, fill="#0e6e6a", colour = "black", size = 1) +
+  xlab(tempnames[i]) +
+  stat_function(fun = dnorm, size = 1, colour = "red",
+                args = list(mean = mean(dataset$temp), sd = sd(dataset$temp))) +
+    geom_vline(aes(xintercept = mean(temp, na.rm = T)),
+                colour = "red", linetype ="longdash", size = .8)
+templist [[i]]
+}
+tempfigure <- ggarrange(plotlist = templist, ncol = ncol, nrow = length(tempnames)/ncol)
+return(tempfigure)
+}
+
+rmse <- function(y, yrep){
+  yrep_mean <- colMeans(yrep)
+  sqrt(mean((yrep_mean - y)^2))
+}
+```
+
+## 1. Dataset Selection
+We picked the World Happiness Dataset (https://www.kaggle.com/datasets/unsdsn/world-happiness) which consists of 165 countries, with observations ranging from 2006 to 2023. However, preprocessing is needed due to many missings, especially in the earlier years. Several variables were obtained by self-report. The columns are:
+
+- _country_ : Country name
+- _year_ : years, ranging from 2006 to 2023 before preprocessing
+- _happiness_ : happiness based self-reporting ranging from 0 (very unhappy) to 10 (very happy)
+- _gdp_ : log gross domestic product per capita
+- _social_support_ : experienced social support
+- _life_expectancy_ : life expectancy at birth (in years)
+- _freedom_ : freedom to make life choices
+- _generosity_ : generosity, willingness to give away
+- _corruption_ : perceived corruption
+- _posaffect_ : positive affect
+- _negaffect_ : negative affect
+
+We enriched the dataset with:
+
+(1) Continents (https://www.kaggle.com/datasets/hserdaraltan/countries-by-continent?resource=download)
+
+(2) Hofstede's six dimensions of culture (https://geerthofstede.com/research-and-vsm/dimension-data-matrix/)
+
+Hofstede's six dimensions entail:
+
+- Power distance index (pdi): The power distance index is defined as “the extent to which the less powerful members of organizations and institutions (like the family) accept and expect that power is distributed unequally.”
+- Individualism vs. collectivism (idv): This index explores the “degree to which people in a society are integrated into groups.”
+- Uncertainty avoidance index (uai): The uncertainty avoidance index is defined as “a society's tolerance for ambiguity,” in which people embrace or avert an event of something unexpected, unknown, or away from the status quo.
+- Masculinity vs. femininity (mas): In this dimension, masculinity is defined as “a preference in society for achievement, heroism, assertiveness and material rewards for success.”
+- Long-term orientation vs. short-term orientation (lto;ltowvs): This dimension associates the connection of the past with the current and future actions/challenges.
+- Indulgence vs. restraint (ind;ivr): This dimension is essentially a measure of happiness; whether or not simple joys are fulfilled.
+
+(source: https://data.world/adamhelsinger/geerthofstedeculturaldimension)
+
+```{r}
+
+##############################
+# Base data: world happiness #
+##############################
+
+# Load data and fix encoding issue's with Turkey, also to make joining possible
+data_raw <- read_csv("World-happiness-report-updated_2024.csv") %>%
+  mutate_all(~ replace(., . == "T\xfcrkiye", "Turkey"))
+names(data_raw) <- gsub(" ","_",tolower(names(data_raw))) #removes capitals and changes spaces to "_"
+
+# renaming some vars to make work easier
+data_raw <- data_raw %>%
+  rename(country = country_name,
+         happiness = life_ladder,
+         gdp = log_gdp_per_capita,
+         life_expectancy = healthy_life_expectancy_at_birth,
+         corruption = perceptions_of_corruption,
+         freedom =freedom_to_make_life_choices,
+         posaffect = positive_affect,
+         negaffect = negative_affect) %>%
+  arrange(country, year) %>%
+  mutate_at(vars(happiness:negaffect), as.numeric)
+
+# A grid of all unique countries and years
+grid <- expand_grid(country = unique(data_raw$country),year = unique(data_raw$year)) %>%
+  arrange(country, year)
+
+data <- grid %>% left_join(data_raw, by = c("country","year"))
+
+# recoding NA to 1, non-missing to 0
+data_na <- data %>% mutate(across(happiness:negaffect, ~ ifelse(is.na(.),1,0)))
+
+na_per_year <- data_na %>%
+  group_by(year) %>% select(!country) %>%
+  summarize_all(sum) %>%
+  mutate(sum = rowSums(across(where(is.numeric))))
+
+# Removing years before 2011
+data <- data %>% filter(year >= 2011)
+
+# Again ecoding NA to 1, non-missing to 0
+data_na <- data %>% mutate(across(happiness:negaffect, ~ ifelse(is.na(.),1,0)))
+
+na_per_country <- data_na %>%
+  group_by(country) %>% select(!year) %>%
+  summarize_all(sum) %>%
+  mutate(sum = rowSums(across(where(is.numeric)))) %>%
+  rowwise() %>%
+  mutate(max = max(across(gdp:negaffect))) %>% ungroup() %>%
+  mutate(drop = ifelse(sum > 27 | max >= 5 | happiness >= 3,1,0))
+
+# Vector of countries that are to be kept
+keep <- na_per_country %>% filter(!(drop == 1)) %>% {unique(.$country)}
+
+# Filling NA first down (LACF) then upward, which is only used if the first year(s) are missing
+data <- data %>% filter(country %in% keep) %>%
+  group_by(country) %>%
+  fill(c(happiness:negaffect), .direction = c("down")) %>%
+  fill(c(happiness:negaffect), .direction = c("up"))
+
+#sum(is.na(data))
+#This is the cleaned dataset with 116 countries, no missings
+
+```
+
+After the cleaning of the original happiness dataset, no missings are found, hence the sum of 'is.na(data)' is `r sum(is.na(data))`. The following steps were taken:
+
+- Re-coding (column)names for readability
+
+- A grid of all unique years and countries was made to assess the missings in the dataset. To ensure maximal reliability, years before 2011 were dropped due to too many missings
+
+- Then countries were excluded. We applied the following heuristic: countries were entirely dropped if one the following conditions was met:
+
+    (1) More than 27 missings in total over the 9 variables (3 average per variable)
+    (2) One variable contains 5 or more missings
+    (3) Target variable 'happiness' contains 3 or more missing
+
+
+- Missings for replaced by filling them downward ('LACF') and then filling them upward. The latter would only apply if the first observation of a country was to be missing. Although more complex, yet more reliable methods like multiple imputations exist, they lie beyond the scope of this assignment, since we focus on creating and comparing models.
+
+- After this step, `r length(unique(data$country))` countries remained in the dataset, with `r nrow(data)` rows and `r ncol(data)` columns. These columns are: happiness (= target variable), country, year and eight other dependent variables.
+
+```{r enrichment-of-data}
+
+#Load cultural dimension and replace `#NULL!` with NA
+hofstede <- read_csv2("6-dimensions-for-website-2015-08-16.csv") %>%
+  mutate_all(~ replace(., . == "#NULL!", NA)) %>%
+  select(!(ctr)) %>%
+  mutate_at(vars(pdi:ivr), as.numeric)
+
+#Load continents, change some names and add some cases to actualize and standarize with existing data
+continents <- read_csv("Countries by continents.csv") %>%
+  mutate_all(~ replace(., . == "Burma (Myanmar)", "Myanmar")) %>%
+  mutate_all(~ replace(., . == "Democratic Republic of Congo", "Congo (Kinshasa")) %>%
+  mutate_all(~ replace(., . == "Congo", "Congo (Brazzaville)")) %>%
+  add_case(Continent = "Africa", Country = "Burkina Faso") %>%
+  add_case(Continent = "Europe", Country = "North Macedonia")
+      
+names(continents) <- gsub(" ","_",tolower(names(continents)))
+
+df <- data %>%
+  left_join(hofstede, by = "country") %>%
+  left_join(continents, by = "country") %>%
+  ungroup()
+
+# sum(is.na(df$continent))
+# All countries are joined with a continent, no missing continents.
+
+df <- df %>% drop_na()
+# Drops all missings in cultural factors
+```
+
+b. Report the number of observations, columns (with their meaning) and their data types. Indicate clearly what you will use as dependent variable/label. 
+<!-- REPORT IT BELOW -->
+
+After joining with continents and Hofstede's cultural factors, all rows containing at least one NA were dropped. The final dataframe contains `r nrow(df)` rows and `r ncol(df)` columns. There are `r sum(is.na(df))` missing values in the data frame. The column names are `r names(df)` of which Happiness is the target (dependent) variable. This is a continuous variable ranging from `r min(df$happiness)` to `r max(df$happiness)`. The meanings of the columns are described above in the dataset explanation. Below, a summary, correlation plot and distribution of the dataframe variables is presented.
+
+The cleaned dataset contains observations from `r length(unique(df$country))` countries which are `r unique(df$country)`.
+
+## Data exploration {.tabset}
+
+### Summary
+```{r summary-df, warning = F}
+summary(df)
+```
+
+### Correlation plot
+```{r correlation-df}
+desc_data <- df %>%
+  group_by(country) %>%
+  summarize_all(mean)
+
+chart.Correlation(desc_data[3:11])
+```
+
+### Distributions
+```{r normality-plot-df}
+normalityplotfunction(df[,c(3:17)], ncol = 3, nbins = 40)
+```
+ 
+##Data split to train and test data
+```{r splitting}
+set.seed(3)
+
+train <- df %>% group_by(country) %>% sample_frac(0.8) %>% ungroup()
+test <- anti_join(df, train)
+
+#write.csv(train, "train.csv")
+#write.csv(test, "test.csv")
+
+```
+
+### Train set scaled summary
+```{r centering-scaling-train}
+r <- c(4:17) #range of numeric variables to scale + centre
+train_scaled <- train
+train_scaled[,r] <- scale(train[,r], scale = T) 
+summary(train_scaled)
+#write.csv(train_scaled, "train_scaled.csv")
+```
+
+### Test set scaled summary
+```{r centering-scaling-test}
+test_scaled <- test
+test_scaled[,r] <- scale(test[,r], scale = apply(train[,r], 2, sd, na.rm = T) , center = apply(train[,r], 2, mean, na.rm = T))
+summary(test_scaled)
+#write.csv(test_scaled, "test_scaled.csv")
+```
+
+```{r removing-unnecessary-data, hide = T}
+#removes unneeded dataframes
+
+rm(continents,
+   data_na,
+   data_raw,
+   desc_data,
+   grid,
+   hofstede,
+   na_per_country,
+   na_per_year,
+   data,
+   keep,
+   r)
+```
+
+
+## Model Exploration
+
+<!-- message = FALSE, results = "hide" prevents displaying output, if you need to show something create another chunk of code -->
+```{r, message = FALSE, results = "hide", cache = T}
+# Models go here
+
+it <- 2000
+seed <- 123
+
+#########################
+# MODEL 1: Happiness ~ GDP   #
+#########################
+
+model1 <- brm(happiness ~ gdp,
+              data = train_scaled,
+              family = gaussian(),
+              seed = seed,
+              file = 'fits/model_1',
+              iter = it)
+
+###################################################
+# MODEL 2: Happiness ~ GDP + some extra variables #
+###################################################
+
+# Based on literature:
+# (1) Slope of Happiness ~ GDP is 0.8  based on literature
+# (2) Corruption and social support is skewed alpha approx -5
+
+mean(train_scaled$happiness)
+2.5*(sd(train_scaled$happiness))
+2.5*(sd(train_scaled$happiness)/sd(train_scaled$gdp))
+2.5*(sd(train_scaled$happiness)/sd(train_scaled$life_expectancy))
+2.5*(sd(train_scaled$happiness)/sd(train_scaled$social_support))
+2.5*(sd(train_scaled$happiness)/sd(train_scaled$freedom))
+2.5*(sd(train_scaled$happiness)/sd(train_scaled$generosity))
+2.5*(sd(train_scaled$happiness)/sd(train_scaled$corruption))
+1/sd(train_scaled$happiness)
+
+gelman2 <- c(prior(normal(6.179298, 2.288415), class = Intercept),
+                   prior(normal(0.8, 0.2), class = b, coef = gdp), # Stevenson and Wolfers (2008)
+                   prior(normal(0, 2.288415), class = b, coef = life_expectancy),
+                   prior(skew_normal(0, 2.288415, 3), class = b, coef = social_support),
+                   prior(normal(0, 2.288415), class = b, coef = freedom),
+                   prior(normal(0, 2.288415), class = b, coef = generosity),
+                   prior(skew_normal(-1.6146, 2.288415, 5), class = b, coef = corruption), #Lang (2012)
+                   prior(exponential(1.092459), class = sigma))
+
+model2 <- brm(happiness ~ gdp + life_expectancy + social_support + freedom + generosity + corruption + factor(year),
+               data = train_scaled,
+               prior = gelman2, # TODO priors need to be updated based on literature
+               family = gaussian(),
+               seed = seed,
+               file = 'fits/model_2',
+               iter = it)
+
+
+##########################################################
+# MODEL 3: Happiness ~ full model with some interactions #
+##########################################################
+
+hs_prior3 <- gelman2 %>% filter(class != "b")
+hs_prior3 <- rbind(hs_prior3,prior(horseshoe(par_ratio = 1), class = b))
+
+model3 <- brm(happiness ~ (gdp + life_expectancy + social_support + freedom + generosity + corruption + posaffect + negaffect)^2 + 
+                year + pdi + idv + mas + uai + ltowvs + ivr + factor(continent),
+              data = train_scaled,
+              prior = hs_prior3, # Use horseshoe priors for this
+              family = gaussian(),
+              seed = seed,
+              file = 'fits/model_3',
+              control = list(adapt_delta = .99,
+                             max_treedepth = 15),
+              iter = it*2)
+
+########################################################################
+# MODEL 4: Happiness ~ GDP + ...model2... | with intercept per country #
+########################################################################
+
+model4 <- brm(happiness ~ gdp + life_expectancy + social_support + freedom + generosity + corruption + factor(year) + (1 | country),
+              data = train_scaled,
+              prior = hs_prior3, # Use horseshoe priors for this
+              family = gaussian(),
+              seed = seed,
+              file = 'fits/model_4',
+              control = list(adapt_delta = .99),
+              iter = it)
+
+###################################################################################################
+# MODEL 5: Happiness ~ GDP + ...model2... | with intercept + slope for social_support per country #
+###################################################################################################
+
+model5 <- brm(happiness ~ gdp + life_expectancy + social_support + freedom + generosity + corruption + factor(year) + (1 + social_support| country),
+              data = train_scaled,
+              prior = gelman2,
+              family = gaussian(),
+              seed = seed,
+              file = 'fits/model_5',
+              control = list(adapt_delta = .99),
+              iter = it)
+```
+
+## Model summaries {.tabset}
+```{r reading-in-models}
+# Modify the string "fits" to the name of the subfolder in which the models are.
+rds_files <- list.files(path = "fits", pattern = "\\.rds$", full.names = TRUE)
+models <- list()
+
+for (file in rds_files) {
+  model <- readRDS(file)
+  model_name <- gsub("\\.rds$", "", basename(file))
+  models[[model_name]] <- model
+}
+```
+
+### Model 1
+
+```{r sum-1}
+# 
+options(max.print = 1000)
+model_1 <- models$model_1
+summary(model_1)
+
+# Checking for convergence
+plot(model_1)
+rhat_values <- rhat(model_1)
+
+# Checking if any R-hat values are significantly greater than 1
+if (any(rhat_values > 1.1)) {
+  print("Warning: Some R-hat values are significantly greater than 1, indicating potential non-convergence.")
+} else {
+  print("All R-hat values are close to 1, indicating good convergence.")
+}
+```
+
+### Model 2
+
+```{r sum-2}
+model_2 <- models$model_2
+summary(model_2)
+
+# Checking for convergence
+plot(model_2)
+rhat_values <- rhat(model_2)
+
+# Checking if any R-hat values are significantly greater than 1
+if (any(rhat_values > 1.1)) {
+  print("Warning: Some R-hat values are significantly greater than 1, indicating potential non-convergence.")
+} else {
+  print("All R-hat values are close to 1, indicating good convergence.")
+}
+```
+
+### Model 3
+
+```{r sum-3}
+model_3 <- models$model_3
+summary(model_3)
+
+# Checking for convergence WARNING: the following command generates lots of plots. You will need to hit enter for a minute straight in the terminal to see them all
+plot(model_3)
+rhat_values <- rhat(model_3)
+
+# Checking if any R-hat values are significantly greater than 1
+if (any(rhat_values > 1.1)) {
+  print("Warning: Some R-hat values are significantly greater than 1, indicating potential non-convergence.")
+} else {
+  print("All R-hat values are close to 1, indicating good convergence.")
+}
+```
+
+
+### Model 4
+
+```{r sum-4}
+model_4 <- models$model_4
+summary(model_4)
+
+# Checking for convergence
+plot(model_4)
+rhat_values <- rhat(model_4)
+
+# Checking if any R-hat values are significantly greater than 1
+if (any(rhat_values > 1.1)) {
+  print("Warning: Some R-hat values are significantly greater than 1, indicating potential non-convergence.")
+} else {
+  print("All R-hat values are close to 1, indicating good convergence.")
+}
+```
+
+### Model 5
+
+```{r sum-5}
+model_5 <- models$model_5
+summary(model_5)
+
+# Checking for convergence
+plot(model_5)
+rhat_values <- rhat(model_5)
+
+# Checking if any R-hat values are significantly greater than 1
+if (any(rhat_values > 1.1)) {
+  print("Warning: Some R-hat values are significantly greater than 1, indicating potential non-convergence.")
+} else {
+  print("All R-hat values are close to 1, indicating good convergence.")
+}
+```
+
+## Model explanations
+
+- (1) Model 1.
+Our simplest model predicts Happiness using GDP. As a model with only fixed effects, it assumes that the effects of GDP on Happiness are the same across all countries. For this model we've used default priors. This model demonstrates the much-researched relationship between measures of happiness and GDP, on a simple level, leaving no room for differences between countries. The intercept of 6.18 can be interpreted as the predicted Happiness score of a country with average GDP in our dataset. The value of the coefficient for Happiness is 0.62; this suggests that as GDP increases, the country gets more happy. The credible intervals for both the intercept and our only fixed effect are reasonably tight.
+
+- (2) Model 2.  
+A step up in complexity from Model 1, Model 2 predicts Happiness using GDP, Year, and measures of Social Support, Life Expectancy, Generosity, Freedom and Corruption. The priors used were in accordance with Gelman et al. (2020), for predictors, the intercept, and also the error. Then we tweaked some priors, based on literature. Stevenson and Wolfers (2008) showed that the effect of log GDP on happiness has a slope of 0.8. Hence, we set the prior of GDP (which is in log) to 0.8 and a SD of 0.2. Based on Lang (2012), we changed the prior distribution of corruption and social support to a skewed normal distribution with alpha of 3 and 5 respectively. Like Model 1, Model 2 operates with fixed effects only; there is no room for different effects for different countries. As expected, the Intercept is the same as in Model 1, but the coefficient for GDP is much lower, at 0.13. Social Support, Freedom and Corruption are the predictors with the largest coefficients; since by including them, GDP's effect became smaller, it can be assumed that there is some correlation between GDP and these measures. GDP, Social Support and Freedom have positive coefficients with positive 95% credible intervals, indicating increases in these measures correlating with higher levels of happiness in a country. Notably, all coefficients of the one hot encoded Year have credible intervals which include zero; in this model Year seems to have no effect on Happiness.
+
+- (3) Model 3.
+All two-way interactions between the core 8 variables from the happiness dataset, enriched with the Hofstede cultural factors, years and continents. (We use horseshoe priors, since we expect most of the resulting many coefficients to not be significant.) Our rationale is that we focus on the 8 core variables, but we are also interested if we can successfully augment the model. Years is an important variable, since it can account for cohort effects in time. For example, the outbreak of covid-19 might have decreased happiness all over the globe. Continents could account for geological effects, however, we expect this effect to be limited. Countries are not added for two reasons. One, it is computationally too difficult. Two, it would reduce the analysis too much down to an N = 1 analysis, since we assume that trends of happiness and other variables are relatively stable. Therefore, much of the variance is expected to be captured in the country variable, although country effects are not our main topic of interest.
+
+- (4) Model 4.
+It extends the complexity of Model 2 by incorporating varying intercepts for each country. This approach acknowledges that the baseline level of happiness may vary across different countries due to unobserved factors unique to each country. The model includes GDP, life expectancy, social support, freedom, generosity, corruption, and year as predictors, along with a varying intercept for each country. The horseshoe priors, which are more suitable for handling sparse data and allowing for regularization of coefficients, are used here. This model better captures the heterogeneity across countries and can provide insights into how country-specific factors influence happiness.
+
+- (5) Model 5.
+It further extends the complexity by including both varying intercepts and varying slopes for social support per country. This means that not only does the baseline level of happiness vary across countries, but the effect of social support on happiness also varies across countries. The predictors remain the same as in Model 4. The use of the Gelman et al. priors helps in allowing the distribution to be dominated by the data given its weak informative qualities. This model allows for a more nuanced understanding of how the relationship between social support and happiness differs across countries, providing a more detailed picture of the dynamics at play.
+
+## Model checking
+
+## Powerscale Sensitivities {.tabset}
+
+Note that we only plotted variables "b_gdp", "b_Intercept", "Intercept" and "sigma" to keep the plots readable.
+
+### Model 1
+
+```{r powersens-1, cache = T}
+print(powerscale_sensitivity(model_1), n = 200)
+powerscale_plot_dens(model_1, variable = c("b_gdp","b_Intercept","Intercept","sigma"))
+```
+
+The returned table and plots indicate that our priors are not informative. This is as expected, as we used default priors, which are meant to not be informative. It is also worth noting that the powerscale sensitivity function shows no conflicting priors. 
+
+### Model 2
+
+```{r powersens-2, cache = T}
+print(powerscale_sensitivity(model_2), n = 200)
+powerscale_plot_dens(model_2, variable = c("b_gdp","b_Intercept","Intercept","sigma"))
+```
+
+The returned table indicates that our priors are not informative. This is as expected, as we used Gelman et al. priors, which are meant to be at most weakly informative. It is also worth noting that the powerscale sensitivity function shows no conflicting priors. 
+
+### Model 3
+
+```{r powersens-3, cache = T}
+print(powerscale_sensitivity(model_3), n = 200)
+powerscale_plot_dens(model_3, variable = c("b_gdp","b_Intercept","Intercept","sigma"))
+```
+
+We used horseshoe priors for Model 3, since we expected most of our coefficients to be insignificant. The powerscale sensitivity table reveals widespread prior-data conflicts, which are expected, as coefficients close to zero are shrunk even smaller by horseshoe priors. 
+
+### Model 4
+
+```{r powersens-4, cache = T}
+print(powerscale_sensitivity(model_4), n = 200)
+powerscale_plot_dens(model_4, variable = c("b_gdp","b_Intercept","Intercept","sigma"))
+```
+
+We used horseshoe priors for Model 4, since we expected most of our coefficients to be insignificant. The powerscale sensitivity table reveals widespread prior-data conflicts, especially for the year variables, which are expected, as coefficients close to zero are shrunk even smaller by horseshoe priors,highlighting the significant impact of the data due to prior-data conflict.
+
+### Model 5
+
+```{r powersens-5, cache = T}
+print(powerscale_sensitivity(model_5), n = 200)
+powerscale_plot_dens(model_5, variable = c("b_gdp","b_Intercept","Intercept","sigma"))
+```
+
+Model 5 includes Gelman priors, and the powerscale sensitivity functions shows no conflicting priors as these are mostly non informative priors. It provides a more balanced fit, reducing prior-data tension.
+
+## Predictive checks {.tabset}
+
+b. Conduct posterior predictive checks for each model to assess how well they fit the data.
+Explain what you conclude.
+
+### Model 1
+
+```{r pred-check-1}
+pp_check(model_1, ndraws = 200)
+pp_check(model_1, type = "stat_2d")
+pp_check(model_1, type = "intervals", x = "gdp", prob_outer = .95)
+```
+
+Posterior predictive checks reveal that the resulting posterior distribution decently approximates the underlying distribution. However, as the model only has one predictor, countries with the same GDP but differing Happiness are given the same Happiness score. As a result, this model would not be a good at obtaining precise predictions at the country-level. As the last figure reveals, the model also has difficulty correctly predicting Happiness in countries where the GDP is several standard deviations lower than average. Also, given there is only one predictive variable, this cannot account for additional unobservable variables that could serve as predictors. 
+
+### Model 2
+
+```{r pred-check-2}
+pp_check(model_2, ndraws = 200)
+pp_check(model_2, type = "stat_2d")
+pp_check(model_2, type = "intervals", x = "gdp", prob_outer = .95)
+```
+
+Our second model's posterior distribution also seems to decently approximate the underlying distribution. On the second figure, the true data seem to lie on the south-west side of the spread of simulated mean, sd combinations. Therefore it seems that our model overestimates both the sd and mean of GDP, in aggregate. The third figure highlights this model's significantly more precise predictions of Happiness at the country level. The simulated intervals are much more responsive to the data when compared to Model 1, as expected, since we included more information.
+
+### Model 3
+
+```{r pred-check-3}
+pp_check(model_3, ndraws = 200)
+pp_check(model_3, type = "stat_2d")
+pp_check(model_3, type = "intervals", x = "gdp", prob_outer = .95)
+```
+
+All in all, the posterior predictive diagnostics of Model 3 are very similar to those of Model 2. One notable improvement is that the second figure no longer shows an overall over approximation of mean and standard deviation by the model. (Some bias is eliminated.)
+
+
+### Model 4
+
+```{r pred-check-4}
+pp_check(model_4, ndraws = 200)
+pp_check(model_4, type = "stat_2d")
+pp_check(model_4, type = "intervals", x = "gdp", prob_outer = .95)
+```
+
+### Model 5
+
+```{r pred-check-5}
+pp_check(model_5, ndraws = 200)
+pp_check(model_5, type = "stat_2d")
+pp_check(model_5, type = "intervals", x = "gdp", prob_outer = .95)
+```
+
+Models 4 & 5 show a slightly better fit for the data compared to the rest of the models by accounting for country-specific variations through varying intercepts and slopes. This leads to a more accurate representation of the happiness distribution, particularly for countries that might have unique socio-economic contexts or outlier characteristics.
+
+## Model Comparison
+
+## k-fold cross-validation to compare the models.
+
+```{r k-fold-CV, cache = T}
+k <- loo::kfold_split_random(K = 10, N = nrow(train_scaled))
+kf_model_1 <- kfold(model_1, folds = k, chains = 1)
+kf_model_2 <- kfold(model_2, folds = k, chains = 1)
+kf_model_3 <- kfold(model_3, folds = k, chains = 1)
+kf_model_4 <- kfold(model_4, folds = k, chains = 1)
+kf_model_5 <- kfold(model_5, folds = k, chains = 1)
+```
+
+
+```{r saving k-fold results, include = F}
+saveRDS(kf_model_1, file = "fits/kf_model_1.rds")
+saveRDS(kf_model_2, file = "fits/kf_model_2.rds")
+saveRDS(kf_model_3, file = "fits/kf_model_3.rds")
+saveRDS(kf_model_4, file = "fits/kf_model_4.rds")
+saveRDS(kf_model_5, file = "fits/kf_model_5.rds")
+
+```
+##Best model based on predictive accuracy.
+```{r loading k-fold results, include = F}
+kf_model_1 <- readRDS("fits/kf_model_1.rds")
+kf_model_2 <- readRDS("fits/kf_model_2.rds")
+kf_model_3 <- readRDS("fits/kf_model_3.rds")
+kf_model_4 <- readRDS("fits/kf_model_4.rds")
+kf_model_5 <- readRDS("fits/kf_model_5.rds")
+
+```
+
+```{r comparison}
+loo_compare(kf_model_1, kf_model_2, kf_model_3,kf_model_4,kf_model_5)
+```
+
+According to the results of our leave-one-out cross-validation, our Model 5 has the highest predictive performance out of all of our models. Models 1, 2 and 3 are significantly worse when it comes to expected log pointwise predictive density, but models 1 and 2 retain the advantage of short fitting times. (In cases where we don't have access to a lot of computing power, using Models 1 and 2 might be advised.) 
+Model 3 takes a long time to run and is significantly less capable at predicting than Model 5 and 4. Since Model 4's elpd is only a few standard deviations away from that of Model 5, it could be worth considering other factors when choosing the best model. For example, if Model 4 had significantly lower time complexity, or was more interpretable than Model 5, there would be a question of whether Model 5's slightly higher predictive performance is worth the trade-off. However, since Models 4 and 5 take relatively the same time to run, and Model 5 is not significantly harder to interpret than Model 4, (the only difference being an additional random effect) Model 5 is clearly the best model.
+
+## Interpretation of Important Parameters
+
+<!-- INTERPRETATION AND CODE GOES HERE -->
+```{r interpretation of best model}
+summary(model_5)
+kf_model_5
+```
+
+Model 5 performs well than the rest comparatively. It analyzes happiness with predictors including GDP, life expectancy, social support, freedom, generosity, corruption, and year, incorporating country-level random effects. The model interprets that higher GDP, social support, and freedom significantly increase happiness, while higher corruption decreases it. The variability across countries is notable, with substantial standard deviations for the intercept and social support. There is no significant correlation between the happiness and the effect of social support on happiness across countries. The credible interval between -0.44 and 0.45 indicates a lot of uncertainty interpreting the true correlation could be anywhere within this range. The model converged well with a residual error of 0.28. Based on 10-fold cross-validation, showing strong predictive accuracy with an elpd_kfold of -133.2, balancing complexity and performance with an effective number of parameters (p_kfold = 97.6) and a low k-fold information criterion (kfoldic = 266.4).
+
+```{r}
+ranef(model_5)
+```
+
+The Ranef function shows the random effects for each cluster (country) in the data. For the varying intercept, we can see that some countries are inherently happier than others, for instance Austria, which has a level of happiness of an estimate of 0.41 higher than the average country with a 95% credible interval of 0.15 and 0.68. Other countries that are significantly happier than the average are countries like Brazil, Colombia, and Mexico, among others. Countries that are significantly less happy than the average include Estonia and Bulgaria, among others. The slopes for social support do not vary among countries, as non of the random effects are significant, indicating that social support does not vary significantly per country on average. 
+
+##Loss function on the test set .
+
+Report RMSE .
+```{r test_scaled}
+test_scaled$year <- as.factor(test_scaled$year)
+```
+
+```{r RMSE model1}
+pred_model1 <- predict(model_1, newdata = test_scaled %>% select(-happiness), summary = FALSE)
+rmse(y = test_scaled$happiness, yrep = pred_model1)
+```
+
+```{r RSME model2}
+pred_model2 <- predict(model_2, newdata = test_scaled %>% select(-happiness), summary = FALSE)
+rmse(y = test_scaled$happiness, yrep = pred_model2)
+```
+
+```{r RSME model3}
+pred_model3 <- predict(model_3, newdata = test_scaled %>% select(-happiness), summary = FALSE)
+rmse(y = test_scaled$happiness, yrep = pred_model3)
+```
+
+```{r RSME model4}
+pred_model4 <- predict(model_4, newdata = test_scaled %>% select(-happiness), summary = FALSE)
+rmse(y = test_scaled$happiness, yrep = pred_model4)
+```
+
+```{r RMSE model5}
+pred_model5 <- predict(model_5, newdata = test_scaled %>% select(-happiness), summary = FALSE)
+rmse(y = test_scaled$happiness, yrep = pred_model5)
+```
+
+According to the RMSE, model 3 presented the lowest RMSE of 0.29 among all test sets. Nevertheless, models 4 and 5 are not far behind the best performance, with a RMSE of around 0.3. Combining this knowledge and the model comparison under section 5, we still conclude that models 4 and 5 are both better models of happiness in a country, since they are more sparse and perform better in other tests. Model 3 is considerably more complex. Despite being slightly better at predicting based on rmse, the increased complexity makes model 3 less desirable than models 4 and 5.
+
+
+
+# References
+
+Gelman A, Hill J, Vehtari A (2020). Regression and Other Stories. Cambridge University Press.
+
+Lang J (2012). The Most Influential Factors in Determining the Happiness of Nations. Major Themes in Economics 14(1) pp 33-54.
+
+Stevenson B and Wolfers J (2008). Economic Growth and Subjective Well-Being: Reassessing the Easterlin Paradox. 14282, Working Paper, August. Cambridge: National Bureau of Economic Research. DOI: 10.3386/w14282.
